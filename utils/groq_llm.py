@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Model can be overridden via env var — no need to touch source code.
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama3-70b-8192"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 _client: Groq | None = None
 
