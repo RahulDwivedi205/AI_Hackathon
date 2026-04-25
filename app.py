@@ -8,6 +8,9 @@ import os
 import time
 from typing import Dict, List
 
+from dotenv import load_dotenv
+load_dotenv()  # must run before any os.getenv checks
+
 import streamlit as st
 
 from utils.demo_code import DEMO_SAMPLES
@@ -227,6 +230,7 @@ DEFAULTS = {
     "result": None, "logs": [],
     "phases": {"detecting": "idle", "exploiting": "idle", "fixing": "idle", "validating": "idle"},
     "running": False,
+    "last_github_url": "",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -502,10 +506,12 @@ if run_btn:
         with st.spinner("Fetching entire repository tree..."):
             try:
                 files_input = fetch_code_from_url(github_url.strip())
+                st.session_state["last_github_url"] = github_url.strip()
             except Exception as e:
                 error_msg = str(e)
     elif raw_code.strip():
         files_input = [{"path": "pasted_code.py", "content": raw_code.strip()}]
+        st.session_state["last_github_url"] = ""  # not a repo scan
     else:
         error_msg = "Please provide a GitHub URL or paste code to analyze."
 
@@ -516,6 +522,7 @@ if run_btn:
 
 if demo_btn:
     sample_key = demo_choice if demo_choice != "— select —" else list(DEMO_SAMPLES.keys())[0]
+    st.session_state["last_github_url"] = ""  # demo is not a real repo
     run_analysis([{"path": "demo.py", "content": DEMO_SAMPLES[sample_key]}])
 
 # ── Results ────────────────────────────────────────────────────────────────────
@@ -692,3 +699,64 @@ with col_c2:
 
 with col_r:
     st.metric("Risk Score", f"{result.get('risk_score', 0)}/100")
+
+st.divider()
+
+# ── SECTION 8 — Push Fixes to GitHub ──────────────────────────────────────────
+st.markdown(card_label("link", "Push Fixes to GitHub"), unsafe_allow_html=True)
+
+findings_for_push = result.get("findings", [])
+passed_findings   = [f for f in findings_for_push if f.get("validation") == "PASS" and f.get("patched_code")]
+source_url        = st.session_state.get("last_github_url", "")
+
+if not source_url:
+    st.info("ℹ️ Push to GitHub is only available when analysis was run on a GitHub repository URL.")
+elif not passed_findings:
+    st.warning("⚠️ No validated patches available to push. Re-run analysis on a GitHub repo and ensure fixes pass review.")
+else:
+    github_token = os.getenv("GITHUB_TOKEN", "")
+
+    col_push_info, col_push_btn = st.columns([3, 1])
+    with col_push_info:
+        st.markdown(
+            f'<div style="font-size:0.85rem;color:#94a3b8;padding-top:0.4rem;">'
+            f'Ready to push <b style="color:#4ade80">{len(passed_findings)}</b> validated fix(es) '
+            f'to <b style="color:#4a9eff">{source_url}</b> as a new branch + PR.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with col_push_btn:
+        push_btn = st.button(
+            "🚀 Push & Open PR",
+            type="primary",
+            use_container_width=True,
+            disabled=not github_token,
+        )
+
+    if not github_token:
+        st.warning("⚠️ `GITHUB_TOKEN` is not set in your `.env` file. Add it to enable pushing.")
+
+    if push_btn and github_token:
+        from utils.github_push import push_fixes_to_github
+        with st.spinner(f"Pushing {len(passed_findings)} fix(es) to GitHub and opening PR..."):
+            push_result = push_fixes_to_github(
+                github_url=source_url,
+                findings=passed_findings,
+                token=github_token,
+            )
+
+        if push_result["success"]:
+            st.success(
+                f"✅ **PR opened successfully!** "
+                f"{push_result['files_pushed']} file(s) pushed to branch `{push_result['branch']}`."
+            )
+            st.markdown(
+                f'<a href="{push_result["pr_url"]}" target="_blank" style="'
+                f'display:inline-flex;align-items:center;gap:8px;'
+                f'background:#052e16;border:1px solid #16a34a;border-radius:8px;'
+                f'padding:10px 20px;color:#4ade80;font-weight:700;text-decoration:none;font-size:0.95rem;">'
+                f'{ICON["link"]} View Pull Request on GitHub</a>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.error(f"❌ Push failed: {push_result['error']}")
