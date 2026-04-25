@@ -3,10 +3,16 @@ SENTINEL AI — Autonomous Repo-Aware Security Swarm
 Production-grade Streamlit dashboard
 """
 
-import re, time
+import logging
+import time
+from typing import Dict, List
+
 import streamlit as st
-from utils.github_fetch import fetch_code_from_url
+
 from utils.demo_code import DEMO_SAMPLES
+from utils.github_fetch import fetch_code_from_url
+
+logging.basicConfig(level=logging.INFO)
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -316,20 +322,45 @@ def render_feed(logs):
 render_feed(st.session_state.logs)
 
 # ── Pipeline runner ────────────────────────────────────────────────────────────
-def run_analysis(files_input: List[Dict[str, str]]):
+def _update_phases_from_log(log_msg: str) -> None:
+    """Drive the stepper state from swarm log messages."""
+    p = st.session_state.phases
+    if "Analyzing" in log_msg:
+        p["detecting"] = "running"
+    if "detected" in log_msg or "SAFE" in log_msg or "No vulnerabilities found" in log_msg:
+        if p["detecting"] == "running":
+            p["detecting"] = "success"
+    if "vulnerability finding" in log_msg or "⚠️" in log_msg:
+        p["detecting"] = "success"
+    if "Generating exploit" in log_msg or "exploit proof" in log_msg.lower():
+        p["exploiting"] = "running"
+    if "Exploit ready" in log_msg or "exploit proofs" in log_msg.lower():
+        p["exploiting"] = "success"
+    if "Fixing" in log_msg or "fix and validation" in log_msg.lower():
+        p["fixing"] = "running"
+    if "Patch generated" in log_msg:
+        p["fixing"] = "success"
+    if "Validating" in log_msg or "Validat" in log_msg:
+        p["validating"] = "running"
+    if "→ SECURE" in log_msg or "Swarm execution complete" in log_msg:
+        p["validating"] = "success"
+    if "STILL VULNERABLE" in log_msg:
+        p["validating"] = "failed"
+
+
+def run_analysis(files_input: List[Dict[str, str]]) -> None:
     st.session_state.logs   = []
     st.session_state.result = None
     st.session_state.phases = {k: "idle" for k in PHASE_LABELS}
 
     from sentinel_swarm import run_swarm
 
-    with st.spinner("Sentinel Swarm is initializing multi-file analysis..."):
+    with st.spinner("Sentinel Swarm initializing multi-file analysis..."):
         final_state = run_swarm(files_input)
 
-    # Simulate streaming logs for UI effect
+    # Stream logs into the UI feed with phase updates
     for log_msg in final_state["logs"]:
-        color = "white"
-        agent = "System"
+        color, agent = "white", "System"
         if "[Agent A" in log_msg:
             color, agent = "red", "Agent A - Hacker"
         elif "[Agent B" in log_msg:
@@ -339,59 +370,112 @@ def run_analysis(files_input: List[Dict[str, str]]):
         elif "[Orchestrator]" in log_msg:
             color, agent = "purple", "Orchestrator"
 
-        # Update Phase status based on agent logs
-        if "Analyzing" in log_msg: st.session_state.phases["detecting"] = "running"
-        if "detected" in log_msg: st.session_state.phases["detecting"] = "success"
-        if "Fixing" in log_msg: st.session_state.phases["fixing"] = "running"
-        if "Patch generated" in log_msg: st.session_state.phases["fixing"] = "success"
-        if "Validating" in log_msg: st.session_state.phases["validating"] = "running"
-        if "SECURE" in log_msg: st.session_state.phases["validating"] = "success"
-        if "STILL VULNERABLE" in log_msg: st.session_state.phases["validating"] = "failed"
+        _update_phases_from_log(log_msg)
 
-        st.session_state.logs.append({"agent": agent, "message": log_msg.split("] ", 1)[-1] if "] " in log_msg else log_msg, "color": color})
+        display_msg = log_msg.split("] ", 1)[-1] if "] " in log_msg else log_msg
+        st.session_state.logs.append(
+            {"agent": agent, "message": display_msg, "color": color}
+        )
         render_feed(st.session_state.logs)
-        stepper_box.markdown(render_stepper(st.session_state.phases), unsafe_allow_html=True)
-        time.sleep(0.2) 
+        stepper_box.markdown(
+            render_stepper(st.session_state.phases), unsafe_allow_html=True
+        )
+        time.sleep(0.15)
 
-    # Aggregate findings for UI display
-    findings = final_state["findings"]
+    # ── Build result dict from all findings ───────────────────────────────────
+    findings: List[Dict] = final_state.get("findings", [])
+
     if findings:
-        report = ""
+        # Full vulnerability report covering every finding
+        report_lines = []
         for f in findings:
-            report += f"### ⚠️ {f['type']} in `{f['file_path']}`\n- **Severity:** {f['severity']}\n- **Explanation:** {f['explanation']}\n\n"
-        
-        main_f = findings[0]
+            status_icon = "✅" if f.get("validation") == "PASS" else "⚠️"
+            report_lines.append(
+                f"### {status_icon} {f['type']} in `{f['file_path']}`\n"
+                f"- **Severity:** {f['severity']}\n"
+                f"- **Explanation:** {f['explanation']}\n"
+                f"- **Validation:** {f.get('validation', 'N/A')}\n"
+            )
+        full_report = "\n".join(report_lines)
+
+        all_pass = all(f.get("validation") == "PASS" for f in findings)
+        has_critical = any(f.get("severity") == "Critical" for f in findings)
+
+        # Risk score: highest severity drives the score
+        severity_scores = {"Critical": 95, "High": 75, "Medium": 50, "Low": 25}
+        risk = max(
+            severity_scores.get(f.get("severity", "Low"), 25) for f in findings
+        )
+
+        # Use the first finding for the primary code/exploit display;
+        # show a tab-style summary for multi-file repos in the report.
+        primary = findings[0]
+
+        # Aggregate exploit scripts from all findings
+        all_scripts = "\n\n".join(
+            f"# ── {f['file_path']} ({f['type']}) ──\n{f.get('exploit_script', '# N/A')}"
+            for f in findings
+        )
+
         st.session_state.result = {
-            "vulnerability_report": report,
-            "risk_score": 100 if any(f['severity'] == 'Critical' for f in findings) else 80,
-            "exploit_payload": main_f["exploit_payload"],
-            "exploit_script": f"# Multi-File Exploit Summary\n# Targeting {main_f['file_path']}\npayload = \"{main_f['exploit_payload']}\"",
-            "exploit_vulnerable_result": "SUCCESS - Target exploited",
-            "exploit_patched_result": "FAIL - Attack blocked" if all(f['validation'] == 'PASS' for f in findings) else "SUCCESS",
-            "original_code": main_f["original_code"],
-            "patched_code": main_f["patched_code"],
-            "reviewer_verdict": "SECURE" if all(f['validation'] == 'PASS' for f in findings) else "STILL VULNERABLE",
-            "reviewer_justification": f"Validated {len(findings)} fixes across the repository.",
-            "confidence_score": 100 if all(f['validation'] == 'PASS' for f in findings) else 40,
-            "iterations": final_state["attempts"],
-            "final_status": "Secure" if all(f['validation'] == 'PASS' for f in findings) else "Not Secure"
+            "findings": findings,
+            "vulnerability_report": full_report,
+            "risk_score": risk,
+            # Exploit — primary finding
+            "exploit_payload": primary.get("exploit_payload", "N/A"),
+            "exploit_script": all_scripts,
+            "exploit_vulnerable_result": primary.get(
+                "exploit_vulnerable_result", "SUCCESS — target exploited"
+            ),
+            "exploit_patched_result": primary.get(
+                "exploit_patched_result",
+                "BLOCKED — attack rejected" if all_pass else "SUCCESS — still vulnerable",
+            ),
+            # Patch — primary finding
+            "original_code": primary.get("original_code", ""),
+            "patched_code": primary.get("patched_code") or "# Patch generation failed",
+            "fix_explanation": primary.get("fix_explanation", ""),
+            # Validation
+            "reviewer_verdict": "SECURE" if all_pass else "STILL VULNERABLE",
+            "reviewer_justification": (
+                f"Validated {len(findings)} finding(s) across "
+                f"{len({f['file_path'] for f in findings})} file(s). "
+                + ("All patches passed adversarial review."
+                   if all_pass
+                   else f"{sum(1 for f in findings if f.get('validation') != 'PASS')} "
+                        f"finding(s) still require attention.")
+            ),
+            "confidence_score": 95 if all_pass else 30,
+            "iterations": final_state.get("attempts", 0),
+            "final_status": "Secure" if all_pass else "Not Secure",
         }
     else:
         st.session_state.result = {
+            "findings": [],
             "vulnerability_report": "✅ No vulnerabilities detected in the repository.",
             "risk_score": 0,
             "exploit_payload": "N/A",
             "exploit_script": "# No exploits generated",
-            "exploit_vulnerable_result": "FAIL",
-            "exploit_patched_result": "FAIL",
+            "exploit_vulnerable_result": "N/A",
+            "exploit_patched_result": "N/A",
             "original_code": "# No vulnerable code found",
             "patched_code": "# No patch needed",
+            "fix_explanation": "",
             "reviewer_verdict": "SECURE",
             "reviewer_justification": "All files analyzed and passed safety checks.",
             "confidence_score": 100,
             "iterations": 0,
-            "final_status": "Secure"
+            "final_status": "Secure",
         }
+
+    # Mark any still-idle phases as success (clean up stepper)
+    for phase_key in ("detecting", "exploiting", "fixing", "validating"):
+        if st.session_state.phases[phase_key] == "idle":
+            st.session_state.phases[phase_key] = "success"
+    stepper_box.markdown(
+        render_stepper(st.session_state.phases), unsafe_allow_html=True
+    )
+
     st.rerun()
 
 # ── Button handlers ────────────────────────────────────────────────────────────
@@ -494,25 +578,59 @@ st.divider()
 # ── SECTION 5 — Patch View ─────────────────────────────────────────────────────
 st.markdown(card_label("wrench", "Patch Applied"), unsafe_allow_html=True)
 
-col_orig, col_fix = st.columns(2)
-with col_orig:
-    st.markdown(
-        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-        f'{ICON["unlock"]}<span style="color:#f87171;font-weight:700;font-size:0.82rem;">Original — Vulnerable</span></div>',
-        unsafe_allow_html=True,
-    )
-    st.code(result.get("original_code", ""), language="python")
+findings = result.get("findings", [])
 
-with col_fix:
-    st.markdown(
-        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-        f'{ICON["lock"]}<span style="color:#4ade80;font-weight:700;font-size:0.82rem;">Patched — Secure</span></div>',
-        unsafe_allow_html=True,
-    )
-    st.code(result.get("patched_code", ""), language="python")
+if len(findings) > 1:
+    # Multi-finding: show a tab per finding
+    tab_labels = [
+        f"{f['file_path'].split('/')[-1]} ({f['type']})" for f in findings
+    ]
+    tabs = st.tabs(tab_labels)
+    for tab, f in zip(tabs, findings):
+        with tab:
+            col_orig, col_fix = st.columns(2)
+            with col_orig:
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+                    f'{ICON["unlock"]}<span style="color:#f87171;font-weight:700;font-size:0.82rem;">'
+                    f'Original — Vulnerable</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(f.get("original_code", ""), language="python")
+            with col_fix:
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+                    f'{ICON["lock"]}<span style="color:#4ade80;font-weight:700;font-size:0.82rem;">'
+                    f'Patched — Secure</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(
+                    f.get("patched_code") or "# Patch generation failed",
+                    language="python",
+                )
+            if f.get("fix_explanation"):
+                st.info(f["fix_explanation"])
+else:
+    # Single finding: original layout
+    col_orig, col_fix = st.columns(2)
+    with col_orig:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+            f'{ICON["unlock"]}<span style="color:#f87171;font-weight:700;font-size:0.82rem;">Original — Vulnerable</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.code(result.get("original_code", ""), language="python")
 
-if result.get("fix_explanation"):
-    st.info(result["fix_explanation"])
+    with col_fix:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+            f'{ICON["lock"]}<span style="color:#4ade80;font-weight:700;font-size:0.82rem;">Patched — Secure</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.code(result.get("patched_code", ""), language="python")
+
+    if result.get("fix_explanation"):
+        st.info(result["fix_explanation"])
 
 st.divider()
 
