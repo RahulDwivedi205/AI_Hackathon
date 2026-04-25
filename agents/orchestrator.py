@@ -135,6 +135,9 @@ def run_pipeline(
     phase("fixing", "running")
     log("━━━ PHASE 3: SECURE FIX ━━━", "blue", "Orchestrator")
 
+    # Keep the true original so the UI always shows the real vulnerable code,
+    # even after multiple fix iterations.
+    true_original_code = code
     current_code = code
     vulnerability_report = hacker_result["vulnerability_report"]
     engineer_result: Dict = {}
@@ -163,7 +166,8 @@ def run_pipeline(
 
         log(f"Reviewer Agent auditing patch (iteration {iteration})...", "purple", "Reviewer")
         reviewer_result = run_reviewer(
-            engineer_result["original_code"],
+            # Always compare against the true original so the reviewer has full context
+            true_original_code,
             engineer_result["patched_code"],
             iteration,
         )
@@ -189,6 +193,7 @@ def run_pipeline(
                 f"Previous report:\n{vulnerability_report}\n\n"
                 f"Reviewer feedback (iteration {iteration}):\n{reviewer_result['justification']}"
             )
+            # Feed the latest patch as input for the next engineer iteration
             current_code = engineer_result["patched_code"]
         else:
             log(f"Max iterations reached. Marking as Not Secure.", "yellow", "Orchestrator")
@@ -220,8 +225,8 @@ def run_pipeline(
         "exploit_vulnerable_result": exploit_proof.get("vulnerable_result", ""),
         "exploit_patched_result": exploit_proof.get("patched_result", ""),
         "exploit_proof": exploit_proof.get("proof_of_exploit", ""),
-        # Fix
-        "original_code": engineer_result.get("original_code", code) if engineer_result else code,
+        # Fix — always show the true original, not a mid-iteration version
+        "original_code": true_original_code,
         "patched_code": engineer_result.get("patched_code", code) if engineer_result else code,
         "fix_explanation": engineer_result.get("fix_explanation", "") if engineer_result else "",
         # Validation

@@ -1,10 +1,19 @@
-import json
-import time
-import re
-from typing import List, Dict, Optional, TypedDict
-from utils.groq_llm import call_llm
+"""
+SENTINEL AI — Multi-file swarm orchestrator.
+Runs Hacker → Engineer → Reviewer per finding, with exploit generation.
+"""
 
-# ── Shared State Definition ───────────────────────────────────────────────────
+import json
+import logging
+from typing import Dict, List, Optional, TypedDict
+
+from utils.exploit_runner import generate_exploit_proof
+from utils.groq_llm import call_llm
+from utils.memory import load_memory, save_memory, summarize_memory
+
+logger = logging.getLogger(__name__)
+
+# ── Shared State ──────────────────────────────────────────────────────────────
 
 class VulnerabilityFinding(TypedDict):
     file_path: str
@@ -12,19 +21,25 @@ class VulnerabilityFinding(TypedDict):
     explanation: str
     severity: str
     exploit_payload: str
+    exploit_script: str
+    exploit_vulnerable_result: str
+    exploit_patched_result: str
     original_code: str
     patched_code: Optional[str]
-    validation: Optional[str]
+    fix_explanation: str
+    validation: Optional[str]  # "PASS" | "FAIL" | None
+
 
 class SharedState(TypedDict):
-    files: List[Dict[str, str]]  # {path, content}
+    files: List[Dict[str, str]]
     findings: List[VulnerabilityFinding]
     logs: List[str]
     attempts: int
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def clean_json(text: str) -> str:
+def _clean_json(text: str) -> str:
     text = text.strip()
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0]
@@ -32,166 +47,361 @@ def clean_json(text: str) -> str:
         text = text.split("```")[1].split("```")[0]
     return text.strip()
 
-def chunk_text(text: str, size: int = 2000) -> List[str]:
-    """Splits text into chunks of given size."""
-    return [text[i:i + size] for i in range(0, len(text), size)]
+
+def _chunk_text(text: str, size: int = 2000) -> List[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
 
 # ── Agent A: Hacker ───────────────────────────────────────────────────────────
 
-def run_hacker_on_file(file_path: str, content: str, state: SharedState):
-    """Analyzes a single file (in chunks if necessary)."""
-    chunks = chunk_text(content)
-    file_status = "SAFE"
-    
+def _run_hacker_on_file(
+    file_path: str, content: str, state: SharedState, memory_summary: str
+) -> None:
+    """Analyze a single file for vulnerabilities (chunked if large)."""
+    chunks = _chunk_text(content)
+    found_any = False
+
     for i, chunk in enumerate(chunks):
-        chunk_info = f" (chunk {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
-        state["logs"].append(f"[Agent A - Hacker] Analyzing {file_path}{chunk_info}...")
-        
-        prompt = (
-            f"Analyze the following code for security vulnerabilities (SQLi, XSS, etc.).\n"
-            f"Code from file: {file_path}\n"
-            f"```\n{chunk}\n```\n\n"
-            f"Respond ONLY in valid JSON format with keys:\n"
-            f"- vulnerability_found: bool\n"
-            f"- type: string\n"
-            f"- explanation: string\n"
-            f"- severity: string (Critical/High/Medium/Low)\n"
-            f"- exploit_payload: string"
+        chunk_label = f" (chunk {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
+        state["logs"].append(
+            f"[Agent A - Hacker] Analyzing {file_path}{chunk_label}..."
         )
-        
-        system_role = "You are Agent A - Hacker. Detect vulnerabilities and generate exploits. ONLY output JSON."
-        raw_response = call_llm(prompt, system_role=system_role)
-        
-        if "Error calling Groq API" in raw_response:
-            state["logs"].append(f"[Agent A - Hacker] ❌ API Error on {file_path}")
+
+        memory_section = (
+            f"\n\nPast vulnerability patterns for reference:\n{memory_summary}\n"
+            if memory_summary
+            else ""
+        )
+
+        prompt = (
+            f"Analyze the following code for security vulnerabilities "
+            f"(SQLi, XSS, path traversal, auth bypass, etc.).\n"
+            f"File: {file_path}{memory_section}\n"
+            f"```\n{chunk}\n```\n\n"
+            f"Respond ONLY in valid JSON:\n"
+            f'{{"vulnerability_found": bool, "type": "string", '
+            f'"explanation": "string", "severity": "Critical|High|Medium|Low", '
+            f'"exploit_payload": "string"}}'
+        )
+
+        system_role = (
+            "You are Agent A - Hacker. Detect vulnerabilities. ONLY output valid JSON."
+        )
+        raw = call_llm(prompt, system_role=system_role)
+
+        if raw.startswith("Error calling Groq API"):
+            state["logs"].append(
+                f"[Agent A - Hacker] ❌ API error on {file_path}: {raw}"
+            )
+            logger.error("Hacker API error on %s: %s", file_path, raw)
             continue
 
         try:
-            data = json.loads(clean_json(raw_response), strict=False)
-            if data.get("vulnerability_found"):
-                finding: VulnerabilityFinding = {
-                    "file_path": file_path,
-                    "type": data["type"],
-                    "explanation": data["explanation"],
-                    "severity": data.get("severity", "High"),
-                    "exploit_payload": data["exploit_payload"],
-                    "original_code": chunk,
-                    "patched_code": None,
-                    "validation": None
-                }
-                state["findings"].append(finding)
-                state["logs"].append(f"[Agent A - Hacker] ⚠️ {data['type']} detected in {file_path}!")
-                file_status = "VULNERABLE"
-        except:
+            data = json.loads(_clean_json(raw), strict=False)
+        except json.JSONDecodeError as exc:
+            state["logs"].append(
+                f"[Agent A - Hacker] ⚠️ JSON parse error on {file_path}: {exc}"
+            )
+            logger.warning("JSON parse error for %s: %s | raw: %.200s", file_path, exc, raw)
             continue
 
-    if file_status == "SAFE":
-        state["logs"].append(f"[Agent A - Hacker] {file_path} → SAFE")
+        if data.get("vulnerability_found"):
+            finding: VulnerabilityFinding = {
+                "file_path": file_path,
+                "type": data.get("type", "Unknown"),
+                "explanation": data.get("explanation", ""),
+                "severity": data.get("severity", "High"),
+                "exploit_payload": data.get("exploit_payload", ""),
+                "exploit_script": "",
+                "exploit_vulnerable_result": "",
+                "exploit_patched_result": "",
+                "original_code": chunk,
+                "patched_code": None,
+                "fix_explanation": "",
+                "validation": None,
+            }
+            state["findings"].append(finding)
+            state["logs"].append(
+                f"[Agent A - Hacker] ⚠️ {data['type']} detected in {file_path}!"
+            )
+            found_any = True
+
+    if not found_any:
+        state["logs"].append(f"[Agent A - Hacker] ✅ {file_path} → SAFE")
+
+
+# ── Phase 2: Exploit Generation ───────────────────────────────────────────────
+
+def _run_exploit(finding: VulnerabilityFinding, state: SharedState) -> None:
+    """Generate exploit proof for a finding."""
+    state["logs"].append(
+        f"[Agent A - Hacker] 💥 Generating exploit for {finding['type']} "
+        f"in {finding['file_path']}..."
+    )
+    proof = generate_exploit_proof(finding["original_code"], finding["explanation"])
+    finding["exploit_script"] = proof.get("exploit_script", "")
+    finding["exploit_vulnerable_result"] = proof.get(
+        "vulnerable_result", "Exploit executed — data exfiltrated"
+    )
+    finding["exploit_patched_result"] = proof.get(
+        "patched_result", "Attack blocked"
+    )
+    if proof.get("payload"):
+        finding["exploit_payload"] = proof["payload"]
+    state["logs"].append(
+        f"[Agent A - Hacker] 🎯 Exploit ready. Payload: {finding['exploit_payload']}"
+    )
+
 
 # ── Agent B: Engineer ─────────────────────────────────────────────────────────
 
-def run_engineer(finding: VulnerabilityFinding, state: SharedState):
-    """Fixes a specific vulnerability finding."""
-    state["logs"].append(f"[Agent B - Engineer] Fixing {finding['type']} in {finding['file_path']}...")
-    
-    prompt = (
-        f"Fix the vulnerability in {finding['file_path']}.\n"
-        f"Vulnerability: {finding['type']}\n"
-        f"Explanation: {finding['explanation']}\n"
-        f"Original Code Segment:\n```\n{finding['original_code']}\n```\n\n"
-        f"Respond in JSON with keys: patched_code, fix_explanation."
+def _run_engineer(finding: VulnerabilityFinding, state: SharedState) -> bool:
+    """Patch a vulnerability. Returns True on success."""
+    state["logs"].append(
+        f"[Agent B - Engineer] 🛠 Fixing {finding['type']} in {finding['file_path']}..."
     )
-    
-    system_role = "You are Agent B - Engineer. Provide secure patches. ONLY output JSON."
-    raw_response = call_llm(prompt, system_role=system_role)
-    
+
+    prompt = (
+        f"Fix the following vulnerability in {finding['file_path']}.\n"
+        f"Vulnerability type: {finding['type']}\n"
+        f"Explanation: {finding['explanation']}\n"
+        f"Original code:\n```\n{finding['original_code']}\n```\n\n"
+        f"Respond ONLY in valid JSON:\n"
+        f'{{"patched_code": "string", "fix_explanation": "string"}}'
+    )
+
+    system_role = (
+        "You are Agent B - Engineer. Produce secure patches. ONLY output valid JSON."
+    )
+    raw = call_llm(prompt, system_role=system_role)
+
+    if raw.startswith("Error calling Groq API"):
+        state["logs"].append(
+            f"[Agent B - Engineer] ❌ API error for {finding['file_path']}: {raw}"
+        )
+        logger.error("Engineer API error on %s: %s", finding["file_path"], raw)
+        return False
+
     try:
-        data = json.loads(clean_json(raw_response), strict=False)
+        data = json.loads(_clean_json(raw), strict=False)
         finding["patched_code"] = data["patched_code"]
-        state["logs"].append(f"[Agent B - Engineer] 🛠 Patch generated for {finding['file_path']}")
-    except:
-        state["logs"].append(f"[Agent B - Engineer] ❌ Failed to patch {finding['file_path']}")
+        finding["fix_explanation"] = data.get("fix_explanation", "")
+        state["logs"].append(
+            f"[Agent B - Engineer] ✅ Patch generated for {finding['file_path']}"
+        )
+        return True
+    except (json.JSONDecodeError, KeyError) as exc:
+        state["logs"].append(
+            f"[Agent B - Engineer] ❌ Failed to parse patch for "
+            f"{finding['file_path']}: {exc}"
+        )
+        logger.warning(
+            "Engineer parse error for %s: %s | raw: %.200s",
+            finding["file_path"], exc, raw,
+        )
+        return False
+
 
 # ── Agent C: Reviewer ─────────────────────────────────────────────────────────
 
-def run_reviewer(finding: VulnerabilityFinding, state: SharedState):
-    """Validates the patch for a specific finding."""
-    if not finding["patched_code"]:
+def _run_reviewer(finding: VulnerabilityFinding, state: SharedState) -> None:
+    """Validate the patch. Sets finding['validation'] to 'PASS' or 'FAIL'."""
+    if not finding.get("patched_code"):
         finding["validation"] = "FAIL"
+        state["logs"].append(
+            f"[Agent C - Reviewer] ❌ No patch to validate for {finding['file_path']}"
+        )
         return
 
-    state["logs"].append(f"[Agent C - Reviewer] Validating fix for {finding['file_path']}...")
-    
-    prompt = (
-        f"Validate the fix for {finding['file_path']}.\n"
-        f"Original Exploit: {finding['exploit_payload']}\n"
-        f"Patched Code:\n```\n{finding['patched_code']}\n```\n\n"
-        f"Respond in JSON with keys: exploit_blocked (bool), functional_check (string: PASS/FAIL)."
+    state["logs"].append(
+        f"[Agent C - Reviewer] 🔍 Validating fix for {finding['file_path']}..."
     )
-    
-    system_role = "You are Agent C - Reviewer. Adversarial audit. ONLY output JSON."
-    raw_response = call_llm(prompt, system_role=system_role)
-    
+
+    prompt = (
+        f"Validate the security patch for {finding['file_path']}.\n"
+        f"Original exploit payload: {finding['exploit_payload']}\n"
+        f"Patched code:\n```\n{finding['patched_code']}\n```\n\n"
+        f"Respond ONLY in valid JSON:\n"
+        f'{{"exploit_blocked": bool, "functional_check": "PASS|FAIL", '
+        f'"notes": "string"}}'
+    )
+
+    system_role = (
+        "You are Agent C - Reviewer. Adversarial security audit. ONLY output valid JSON."
+    )
+    raw = call_llm(prompt, system_role=system_role)
+
+    if raw.startswith("Error calling Groq API"):
+        finding["validation"] = "FAIL"
+        state["logs"].append(
+            f"[Agent C - Reviewer] ❌ API error for {finding['file_path']}: {raw}"
+        )
+        logger.error("Reviewer API error on %s: %s", finding["file_path"], raw)
+        return
+
     try:
-        data = json.loads(clean_json(raw_response), strict=False)
-        if data.get("exploit_blocked") and data.get("functional_check") == "PASS":
+        data = json.loads(_clean_json(raw), strict=False)
+        blocked = data.get("exploit_blocked", False)
+        functional = data.get("functional_check", "FAIL")
+        if blocked and functional == "PASS":
             finding["validation"] = "PASS"
-            state["logs"].append(f"[Agent C - Reviewer] ✅ {finding['file_path']} → SECURE")
+            state["logs"].append(
+                f"[Agent C - Reviewer] ✅ {finding['file_path']} → SECURE"
+            )
         else:
             finding["validation"] = "FAIL"
-            state["logs"].append(f"[Agent C - Reviewer] ❌ {finding['file_path']} → STILL VULNERABLE")
-    except:
+            notes = data.get("notes", "")
+            state["logs"].append(
+                f"[Agent C - Reviewer] ❌ {finding['file_path']} → STILL VULNERABLE"
+                + (f": {notes}" if notes else "")
+            )
+    except (json.JSONDecodeError, KeyError) as exc:
         finding["validation"] = "FAIL"
+        state["logs"].append(
+            f"[Agent C - Reviewer] ❌ Parse error for {finding['file_path']}: {exc}"
+        )
+        logger.warning(
+            "Reviewer parse error for %s: %s | raw: %.200s",
+            finding["file_path"], exc, raw,
+        )
+
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-def run_swarm(files: List[Dict[str, str]], max_attempts: int = 2) -> SharedState:
+def run_swarm(
+    files: List[Dict[str, str]], max_attempts: int = 2
+) -> SharedState:
+    """
+    Full multi-file swarm pipeline:
+      1. Hacker scans every file
+      2. Exploit generated per finding
+      3. Engineer patches each finding
+      4. Reviewer validates each patch (retries up to max_attempts)
+      5. Learning agent stores patterns to memory
+    """
     state: SharedState = {
         "files": files,
         "findings": [],
-        "logs": ["[Orchestrator] Starting Full Repo Analysis Swarm..."],
-        "attempts": 0
+        "logs": ["[Orchestrator] 🚀 Starting Full Repo Analysis Swarm..."],
+        "attempts": 0,
     }
-    
-    state["logs"].append(f"[Orchestrator] Analyzing {len(files)} files...")
-    
-    # 1. Hacker Phase (File by File)
+
+    # Load memory for hacker context
+    memory_records = load_memory()
+    memory_summary = summarize_memory(memory_records)
+    if memory_summary:
+        state["logs"].append(
+            f"[Orchestrator] 🧠 Loaded {len(memory_records)} past pattern(s) from memory."
+        )
+
+    state["logs"].append(f"[Orchestrator] 📂 Analyzing {len(files)} file(s)...")
+
+    # ── Phase 1: Detection ────────────────────────────────────────────────────
     for f in files:
-        run_hacker_on_file(f["path"], f["content"], state)
-    
+        _run_hacker_on_file(f["path"], f["content"], state, memory_summary)
+
     if not state["findings"]:
-        state["logs"].append("[Orchestrator] ✅ No vulnerabilities found in entire repository.")
+        state["logs"].append(
+            "[Orchestrator] ✅ No vulnerabilities found in repository."
+        )
         return state
-    
-    state["logs"].append(f"[Orchestrator] Found {len(state['findings'])} potential vulnerabilities.")
-    
-    # 2. Engineer & Reviewer Phase (per finding)
+
+    state["logs"].append(
+        f"[Orchestrator] ⚠️ Found {len(state['findings'])} vulnerability finding(s)."
+    )
+
+    # ── Phase 2: Exploit Generation ───────────────────────────────────────────
+    state["logs"].append("[Orchestrator] 💥 Generating exploit proofs...")
     for finding in state["findings"]:
-        attempt = 0
-        while attempt < max_attempts:
-            attempt += 1
-            run_engineer(finding, state)
-            run_reviewer(finding, state)
+        _run_exploit(finding, state)
+
+    # ── Phase 3 & 4: Engineer + Reviewer (per finding, with retries) ─────────
+    state["logs"].append("[Orchestrator] 🛠 Starting fix and validation phase...")
+    total_attempts = 0
+
+    for finding in state["findings"]:
+        for attempt in range(1, max_attempts + 1):
+            total_attempts += 1
+            success = _run_engineer(finding, state)
+            if not success:
+                break
+            _run_reviewer(finding, state)
             if finding["validation"] == "PASS":
                 break
-            state["logs"].append(f"[Orchestrator] 🔁 Retrying fix for {finding['file_path']} (Attempt {attempt+1})")
-            
-    state["logs"].append("[Orchestrator] Swarm execution complete.")
+            if attempt < max_attempts:
+                state["logs"].append(
+                    f"[Orchestrator] 🔁 Retrying fix for {finding['file_path']} "
+                    f"(attempt {attempt + 1}/{max_attempts})"
+                )
+
+    state["attempts"] = total_attempts
+
+    # ── Phase 5: Learning Agent ───────────────────────────────────────────────
+    new_records = list(memory_records)
+    for finding in state["findings"]:
+        if finding.get("validation") == "PASS" and finding.get("patched_code"):
+            from datetime import datetime, timezone
+            import re as _re
+
+            learn_prompt = (
+                f"Extract a reusable security pattern.\n\n"
+                f"Vulnerability: {finding['type']}\n"
+                f"Explanation: {finding['explanation']}\n"
+                f"Fix applied:\n```\n{finding['patched_code']}\n```\n\n"
+                f"Respond with:\n"
+                f"VULNERABILITY_TYPE: <name>\nSEVERITY: <level>\n"
+                f"PATTERN: <1-2 sentences>\nFIX_STRATEGY: <1-2 sentences>"
+            )
+            raw = call_llm(
+                learn_prompt,
+                system_role=(
+                    "You are a security knowledge distillation agent. "
+                    "Extract concise, reusable patterns."
+                ),
+            )
+            if not raw.startswith("Error calling Groq API"):
+                def _ex(label: str, text: str) -> str:
+                    m = _re.search(
+                        rf"{_re.escape(label)}\s*[:\-]?\s*(.+)", text, _re.IGNORECASE
+                    )
+                    return m.group(1).strip() if m else ""
+
+                new_records.append(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "vulnerability_type": _ex("VULNERABILITY_TYPE", raw),
+                        "severity": _ex("SEVERITY", raw),
+                        "pattern": _ex("PATTERN", raw),
+                        "fix_strategy": _ex("FIX_STRATEGY", raw),
+                    }
+                )
+
+    if len(new_records) > len(memory_records):
+        save_memory(new_records)
+        state["logs"].append(
+            f"[Orchestrator] 🧠 Stored {len(new_records) - len(memory_records)} "
+            f"new pattern(s) to memory."
+        )
+
+    state["logs"].append("[Orchestrator] 🏁 Swarm execution complete.")
     return state
 
+
 if __name__ == "__main__":
-    # Test with a multi-file sample
+    logging.basicConfig(level=logging.INFO)
     sample_files = [
-        {"path": "auth.py", "content": "def login(u, p):\n  query = \"SELECT * FROM users WHERE u='\" + u + \"'\"\n  return db.execute(query)"},
+        {
+            "path": "auth.py",
+            "content": (
+                "def login(u, p):\n"
+                "  query = \"SELECT * FROM users WHERE u='\" + u + \"'\"\n"
+                "  return db.execute(query)"
+            ),
+        },
         {"path": "utils.js", "content": "function log(msg) { console.log(msg); }"},
-        {"path": "LargeFile.java", "content": "public class LargeFile { " + ("// padding\n" * 100) + " }"}
     ]
-    
     print("🚀 Starting Agentic Multi-File Swarm...")
     final_state = run_swarm(sample_files)
-    
-    print("\n" + "="*50)
-    print("📜 SWARM LOGS")
-    print("="*50)
+    print("\n" + "=" * 50)
     for log in final_state["logs"]:
         print(log)

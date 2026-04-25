@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+.env.*
+
+# Sentinel AI runtime data — contains scan results, do not commit
+memory.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

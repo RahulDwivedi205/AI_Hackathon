@@ -1,42 +1,64 @@
-import time
+"""
+GitHub repository fetcher with rate-limit handling, caching, and request throttling.
+"""
+
+import logging
 import os
 import re
+import time
+from typing import Dict, List, Optional, Tuple
+
 import requests
-from typing import List, Dict, Tuple, Optional
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = (".py", ".js", ".ts", ".java")
-IGNORE_DIRS = ("node_modules", "dist", "build", ".git", "__pycache__")
+IGNORE_DIRS = ("node_modules", "dist", "build", ".git", "__pycache__", "vendor")
 MAX_FILES = 20
 GITHUB_API_BASE = "https://api.github.com/repos"
+# Polite delay between raw-file fetches to avoid secondary rate limits
+_FETCH_DELAY_SEC = 0.3
 
-# ── In-Memory Cache ────────────────────────────────────────────────────────────
-REPO_CACHE: Dict[str, str] = {}
+# ── In-memory cache (keyed by repo URL) ──────────────────────────────────────
+_REPO_CACHE: Dict[str, List[Dict[str, str]]] = {}
 
-def get_headers(token: Optional[str] = None) -> Dict[str, str]:
+
+def _get_headers(token: Optional[str] = None) -> Dict[str, str]:
     headers = {"Accept": "application/vnd.github.v3+json"}
-    if not token:
-        token = os.getenv("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"token {token}"
+    resolved_token = token or os.getenv("GITHUB_TOKEN")
+    if resolved_token:
+        headers["Authorization"] = f"token {resolved_token}"
     return headers
 
-def check_rate_limit(headers: Dict[str, str]):
-    """Checks GitHub rate limit and warns if low."""
-    try:
-        response = requests.get("https://api.github.com/rate_limit", headers=headers, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            remaining = data["resources"]["core"]["remaining"]
-            if remaining < 10:
-                print(f"⚠️ WARNING: GitHub API rate limit nearly exceeded ({remaining} remaining).")
-            if remaining == 0:
-                reset_time = data["resources"]["core"]["reset"]
-                wait_sec = max(0, reset_time - time.time())
-                raise RuntimeError(f"GitHub API rate limit exceeded. Resets in {int(wait_sec)} seconds.")
-    except Exception:
-        pass
 
-def parse_github_url(url: str) -> Tuple[str, str]:
+def _check_rate_limit(headers: Dict[str, str]) -> None:
+    """Raise RuntimeError if the GitHub core rate limit is exhausted."""
+    try:
+        resp = requests.get(
+            "https://api.github.com/rate_limit", headers=headers, timeout=5
+        )
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        remaining = data["resources"]["core"]["remaining"]
+        if remaining < 10:
+            logger.warning(
+                "GitHub API rate limit nearly exhausted (%d remaining).", remaining
+            )
+        if remaining == 0:
+            reset_time = data["resources"]["core"]["reset"]
+            wait_sec = max(0, int(reset_time - time.time()))
+            raise RuntimeError(
+                f"GitHub API rate limit exceeded. Resets in {wait_sec}s. "
+                "Set GITHUB_TOKEN for a higher limit."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.debug("Rate-limit check failed (non-fatal): %s", exc)
+
+
+def _parse_github_url(url: str) -> Tuple[str, str]:
     url = url.strip().rstrip("/")
     pattern = r"^https?://(?:www\.)?github\.com/([^/]+)/([^/\s]+?)(?:\.git)?(?:/.*)?$"
     match = re.match(pattern, url)
@@ -44,54 +66,103 @@ def parse_github_url(url: str) -> Tuple[str, str]:
         raise ValueError(f"Invalid GitHub URL: '{url}'")
     return match.group(1), match.group(2)
 
-def fetch_repo_tree(owner: str, repo: str, token: Optional[str] = None) -> List[Dict]:
-    """Fetches the full recursive tree of the repository."""
-    headers = get_headers(token)
-    check_rate_limit(headers)
-    
-    for branch in ["main", "master"]:
-        api_url = f"{GITHUB_API_BASE}/{owner}/{repo}/git/trees/{branch}?recursive=1"
-        response = requests.get(api_url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            return response.json().get("tree", [])
+
+def _fetch_repo_tree(
+    owner: str, repo: str, headers: Dict[str, str]
+) -> List[Dict]:
+    """Return the recursive file tree, trying main then master branch."""
+    for branch in ("main", "master"):
+        api_url = (
+            f"{GITHUB_API_BASE}/{owner}/{repo}/git/trees/{branch}?recursive=1"
+        )
+        try:
+            resp = requests.get(api_url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json().get("tree", [])
+        except requests.RequestException as exc:
+            logger.warning("Tree fetch failed for branch %s: %s", branch, exc)
     return []
 
-def fetch_code_from_url(github_url: str) -> List[Dict[str, str]]:
+
+def fetch_code_from_url(
+    github_url: str, token: Optional[str] = None
+) -> List[Dict[str, str]]:
     """
-    Fetches all supported files from the repo and returns a list of {path, content}.
+    Fetch up to MAX_FILES supported source files from a public GitHub repo.
+
+    Returns a list of {"path": str, "content": str} dicts.
+    Results are cached in-process by URL.
     """
+    cache_key = github_url.strip()
+    if cache_key in _REPO_CACHE:
+        logger.info("Returning cached result for %s", cache_key)
+        return _REPO_CACHE[cache_key]
+
     try:
-        owner, repo = parse_github_url(github_url)
-        tree = fetch_repo_tree(owner, repo)
-        
-        if not tree:
-            raise RuntimeError(f"Could not fetch repository tree for {owner}/{repo}")
+        owner, repo = _parse_github_url(github_url)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
-        files_to_fetch = []
-        for item in tree:
-            if item["type"] == "blob":
-                path = item["path"]
-                if any(path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-                    if not any(ignored in path for ignored in IGNORE_DIRS):
-                        files_to_fetch.append(path)
-            if len(files_to_fetch) >= MAX_FILES:
-                break
+    headers = _get_headers(token)
 
-        results = []
-        headers = get_headers()
-        for path in files_to_fetch:
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
-            resp = requests.get(raw_url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/master/{path}"
-                resp = requests.get(raw_url, headers=headers, timeout=10)
-            
+    try:
+        _check_rate_limit(headers)
+    except RuntimeError:
+        raise
+
+    tree = _fetch_repo_tree(owner, repo, headers)
+    if not tree:
+        raise RuntimeError(
+            f"Could not fetch repository tree for {owner}/{repo}. "
+            "The repo may be empty, private, or the URL is incorrect."
+        )
+
+    # Collect eligible file paths (respecting MAX_FILES cap)
+    files_to_fetch: List[str] = []
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+        path: str = item.get("path", "")
+        if not any(path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            continue
+        if any(ignored in path for ignored in IGNORE_DIRS):
+            continue
+        files_to_fetch.append(path)
+        if len(files_to_fetch) >= MAX_FILES:
+            break
+
+    if not files_to_fetch:
+        raise RuntimeError(
+            f"No supported source files ({', '.join(SUPPORTED_EXTENSIONS)}) "
+            f"found in {owner}/{repo}."
+        )
+
+    results: List[Dict[str, str]] = []
+    for path in files_to_fetch:
+        content = _fetch_raw_file(owner, repo, path, headers)
+        if content is not None:
+            results.append({"path": path, "content": content})
+        time.sleep(_FETCH_DELAY_SEC)  # polite throttle
+
+    if not results:
+        raise RuntimeError(f"Could not download any files from {owner}/{repo}.")
+
+    _REPO_CACHE[cache_key] = results
+    logger.info("Fetched %d file(s) from %s/%s.", len(results), owner, repo)
+    return results
+
+
+def _fetch_raw_file(
+    owner: str, repo: str, path: str, headers: Dict[str, str]
+) -> Optional[str]:
+    """Try main then master branch for a raw file. Returns content or None."""
+    for branch in ("main", "master"):
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
-                results.append({"path": path, "content": resp.text})
-        
-        return results
-
-    except Exception as e:
-        if "403" in str(e):
-            raise RuntimeError("GitHub API rate limit exceeded. Please set GITHUB_TOKEN.")
-        raise RuntimeError(f"Error fetching full repo: {str(e)}")
+                return resp.text
+        except requests.RequestException as exc:
+            logger.debug("Raw fetch failed for %s@%s: %s", path, branch, exc)
+    logger.warning("Could not fetch %s from %s/%s.", path, owner, repo)
+    return None
