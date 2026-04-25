@@ -5,3 +5,4 @@ requests==2.33.1
 pandas==3.0.2
 hypothesis==6.152.2
 pytest==9.0.3
+fpdf2==2.7.9
