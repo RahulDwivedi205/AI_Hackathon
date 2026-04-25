@@ -10,6 +10,14 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+# Streamlit Cloud: pull GITHUB_TOKEN from st.secrets if not in env
+try:
+    import streamlit as _st
+    if "GITHUB_TOKEN" in _st.secrets and not os.getenv("GITHUB_TOKEN"):
+        os.environ["GITHUB_TOKEN"] = _st.secrets["GITHUB_TOKEN"]
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = (".py", ".js", ".ts", ".java")
