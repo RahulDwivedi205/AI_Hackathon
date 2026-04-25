@@ -5,11 +5,22 @@ Runs Hacker → Engineer → Reviewer per finding, with exploit generation.
 
 import json
 import logging
+import re as _re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, TypedDict
 
 from utils.exploit_runner import generate_exploit_proof
 from utils.groq_llm import call_llm
 from utils.memory import load_memory, save_memory, summarize_memory
+
+# Cap memory to avoid unbounded growth
+MEMORY_MAX_RECORDS = 100
+
+
+def _ex(label: str, text: str) -> str:
+    """Extract a single-line value after a label from LLM text."""
+    m = _re.search(rf"{_re.escape(label)}\s*[:\-]?\s*(.+)", text, _re.IGNORECASE)
+    return m.group(1).strip() if m else ""
 
 logger = logging.getLogger(__name__)
 
@@ -340,9 +351,6 @@ def run_swarm(
     new_records = list(memory_records)
     for finding in state["findings"]:
         if finding.get("validation") == "PASS" and finding.get("patched_code"):
-            from datetime import datetime, timezone
-            import re as _re
-
             learn_prompt = (
                 f"Extract a reusable security pattern.\n\n"
                 f"Vulnerability: {finding['type']}\n"
@@ -360,12 +368,6 @@ def run_swarm(
                 ),
             )
             if not raw.startswith("Error calling Groq API"):
-                def _ex(label: str, text: str) -> str:
-                    m = _re.search(
-                        rf"{_re.escape(label)}\s*[:\-]?\s*(.+)", text, _re.IGNORECASE
-                    )
-                    return m.group(1).strip() if m else ""
-
                 new_records.append(
                     {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -377,7 +379,9 @@ def run_swarm(
                 )
 
     if len(new_records) > len(memory_records):
-        save_memory(new_records)
+        # Trim to cap before saving
+        trimmed = new_records[-MEMORY_MAX_RECORDS:]
+        save_memory(trimmed)
         state["logs"].append(
             f"[Orchestrator] 🧠 Stored {len(new_records) - len(memory_records)} "
             f"new pattern(s) to memory."

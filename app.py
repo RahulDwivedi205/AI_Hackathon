@@ -4,6 +4,7 @@ Production-grade Streamlit dashboard
 """
 
 import logging
+import os
 import time
 from typing import Dict, List
 
@@ -13,6 +14,17 @@ from utils.demo_code import DEMO_SAMPLES
 from utils.github_fetch import fetch_code_from_url
 
 logging.basicConfig(level=logging.INFO)
+
+# ── Startup: fail fast if API key is missing ───────────────────────────────────
+if not os.getenv("GROQ_API_KEY"):
+    st.set_page_config(page_title="SENTINEL AI", page_icon="🛡", layout="wide")
+    st.error(
+        "**GROQ_API_KEY is not set.**\n\n"
+        "Create a `.env` file in the project root with:\n"
+        "```\nGROQ_API_KEY=your_key_here\n```\n"
+        "Then restart the app."
+    )
+    st.stop()
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -356,7 +368,12 @@ def run_analysis(files_input: List[Dict[str, str]]) -> None:
     from sentinel_swarm import run_swarm
 
     with st.spinner("Sentinel Swarm initializing multi-file analysis..."):
-        final_state = run_swarm(files_input)
+        try:
+            final_state = run_swarm(files_input)
+        except Exception as exc:
+            st.error(f"Analysis failed: {exc}")
+            logging.exception("run_swarm raised an exception")
+            return
 
     # Stream logs into the UI feed with phase updates
     for log_msg in final_state["logs"]:
@@ -399,7 +416,6 @@ def run_analysis(files_input: List[Dict[str, str]]) -> None:
         full_report = "\n".join(report_lines)
 
         all_pass = all(f.get("validation") == "PASS" for f in findings)
-        has_critical = any(f.get("severity") == "Critical" for f in findings)
 
         # Risk score: highest severity drives the score
         severity_scores = {"Critical": 95, "High": 75, "Medium": 50, "Low": 25}

@@ -1,0 +1,19 @@
+# Secrets — never bake into image
+.env
+.env.*
+
+# Runtime data
+memory.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Dev/test
+.git/
+tests/
+*.log
+.DS_Store
