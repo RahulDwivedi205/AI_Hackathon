@@ -5,6 +5,7 @@ Production-grade Streamlit dashboard
 
 import logging
 import os
+import re
 import time
 from typing import Dict, List
 
@@ -28,6 +29,7 @@ if not os.getenv("GROQ_API_KEY"):
         "Then restart the app."
     )
     st.stop()
+
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -527,7 +529,8 @@ if demo_btn:
 
 # ── Results ────────────────────────────────────────────────────────────────────
 result = st.session_state.result
-if not result:
+print("result => ", result)
+if result is None:
     st.stop()
 
 st.divider()
