@@ -220,6 +220,8 @@ ICON = {
     "unlock":  svg('<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>', "#f87171"),
     "link":    svg('<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>', "#94a3b8", 16),
     "cpu":     svg('<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/>', "#a855f7"),
+    "download": svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>', "#4ade80"),
+    "chat":    svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>', "#facc15"),
 }
 
 def card_label(icon_key, text):
@@ -231,6 +233,7 @@ DEFAULTS = {
     "phases": {"detecting": "idle", "exploiting": "idle", "fixing": "idle", "validating": "idle"},
     "running": False,
     "last_github_url": "",
+    "chat_history": [],
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -558,6 +561,38 @@ with st.expander("Full Vulnerability Report", expanded=True):
         unsafe_allow_html=True,
     )
 
+# ── CVSS Scores per finding ────────────────────────────────────────────────────
+cvss_findings = [f for f in result.get("findings", []) if f.get("cvss_score", 0) > 0]
+if cvss_findings:
+    with st.expander("CVSS 3.1 Scores", expanded=False):
+        CVSS_COLORS = {
+            "Critical": "#ef4444", "High": "#f97316",
+            "Medium": "#eab308", "Low": "#4ade80", "None": "#64748b",
+        }
+        for f in cvss_findings:
+            score   = f.get("cvss_score", 0)
+            rating  = f.get("cvss_rating", "")
+            vector  = f.get("cvss_vector", "")
+            color   = CVSS_COLORS.get(rating, "#94a3b8")
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:12px;'
+                f'padding:8px 12px;margin-bottom:6px;'
+                f'background:rgba(255,255,255,0.03);border-radius:8px;'
+                f'border-left:3px solid {color};">'
+                f'<span style="font-size:1.4rem;font-weight:900;color:{color};min-width:40px;">{score}</span>'
+                f'<div>'
+                f'<div style="font-weight:700;color:#e2e8f0;font-size:0.85rem;">'
+                f'{f["file_path"]} — {f["type"]}</div>'
+                f'<div style="font-size:0.72rem;color:#64748b;font-family:monospace;">'
+                f'CVSS:3.1/{vector}</div>'
+                f'</div>'
+                f'<span style="margin-left:auto;background:{color}22;border:1px solid {color};'
+                f'border-radius:6px;padding:2px 10px;color:{color};font-size:0.75rem;font-weight:700;">'
+                f'{rating}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
 st.divider()
 
 # ── SECTION 4 — Exploit Output ─────────────────────────────────────────────────
@@ -760,3 +795,106 @@ else:
             )
         else:
             st.error(f"❌ Push failed: {push_result['error']}")
+
+st.divider()
+
+# ── SECTION 9 — PDF Report Download ───────────────────────────────────────────
+st.markdown(card_label("download", "Download Security Report"), unsafe_allow_html=True)
+
+col_pdf_info, col_pdf_btn = st.columns([3, 1])
+with col_pdf_info:
+    st.markdown(
+        '<div style="font-size:0.85rem;color:#94a3b8;padding-top:0.5rem;">'
+        'Export a professional PDF report with all findings, CVSS scores, '
+        'exploit proofs, patches, and validation results.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+with col_pdf_btn:
+    gen_pdf_btn = st.button("📄 Generate PDF", type="secondary", use_container_width=True)
+
+if gen_pdf_btn:
+    from utils.pdf_report import generate_pdf_report
+    with st.spinner("Generating PDF report..."):
+        try:
+            pdf_bytes = generate_pdf_report(
+                result,
+                source=st.session_state.get("last_github_url", "Pasted Code"),
+            )
+            st.download_button(
+                label="⬇️ Download Report PDF",
+                data=pdf_bytes,
+                file_name="sentinel_ai_security_report.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+            st.success("✅ PDF ready — click the button above to download.")
+        except Exception as exc:
+            st.error(f"PDF generation failed: {exc}")
+            logging.exception("PDF generation error")
+
+st.divider()
+
+# ── SECTION 10 — Ask the Agent ─────────────────────────────────────────────────
+st.markdown(card_label("chat", "Ask the Agent"), unsafe_allow_html=True)
+st.markdown(
+    '<div style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.8rem;">'
+    'Ask anything about the analysis — why a vulnerability is dangerous, '
+    'how to prevent it, what the patch does, or what would happen in production.'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+# Render chat history
+chat_history = st.session_state.get("chat_history", [])
+for msg in chat_history:
+    role_color = "#4a9eff" if msg["role"] == "user" else "#c084fc"
+    role_label = "You" if msg["role"] == "user" else "Agent"
+    align      = "right" if msg["role"] == "user" else "left"
+    bg         = "rgba(74,158,255,0.08)" if msg["role"] == "user" else "rgba(192,132,252,0.08)"
+    border     = "#4a9eff" if msg["role"] == "user" else "#c084fc"
+    st.markdown(
+        f'<div style="text-align:{align};margin-bottom:8px;">'
+        f'<span style="font-size:0.7rem;color:{role_color};font-weight:700;">{role_label}</span><br>'
+        f'<span style="display:inline-block;background:{bg};border:1px solid {border}22;'
+        f'border-radius:10px;padding:8px 14px;font-size:0.85rem;color:#e2e8f0;'
+        f'max-width:85%;text-align:left;">{msg["content"]}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+# Chat input
+user_question = st.chat_input("Ask about the vulnerabilities, fixes, or security concepts...")
+
+if user_question:
+    from utils.groq_llm import call_llm
+
+    # Build context from current analysis
+    findings_summary = ""
+    for f in result.get("findings", []):
+        findings_summary += (
+            f"\n- {f['type']} in {f['file_path']} "
+            f"(Severity: {f['severity']}, CVSS: {f.get('cvss_score', 'N/A')}, "
+            f"Validation: {f.get('validation', 'N/A')})"
+        )
+
+    system_ctx = (
+        "You are SENTINEL AI's security expert assistant. "
+        "You have just completed a security analysis with the following results:\n"
+        f"Risk Score: {result.get('risk_score', 0)}/100\n"
+        f"Final Status: {result.get('final_status', 'Unknown')}\n"
+        f"Findings:{findings_summary if findings_summary else ' None'}\n\n"
+        "Answer the user's question clearly and concisely. "
+        "Be technical but accessible. Focus on practical security guidance."
+    )
+
+    # Append user message
+    chat_history.append({"role": "user", "content": user_question})
+    st.session_state["chat_history"] = chat_history
+
+    with st.spinner("Agent thinking..."):
+        answer = call_llm(user_question, system_role=system_ctx)
+
+    chat_history.append({"role": "assistant", "content": answer})
+    st.session_state["chat_history"] = chat_history
+    st.rerun()

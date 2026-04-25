@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, TypedDict
 from utils.exploit_runner import generate_exploit_proof
 from utils.groq_llm import call_llm
 from utils.memory import load_memory, save_memory, summarize_memory
+from utils.cvss import calculate_cvss
 
 # Cap memory to avoid unbounded growth
 MEMORY_MAX_RECORDS = 100
@@ -31,6 +32,9 @@ class VulnerabilityFinding(TypedDict):
     type: str
     explanation: str
     severity: str
+    cvss_score: float
+    cvss_vector: str
+    cvss_rating: str
     exploit_payload: str
     exploit_script: str
     exploit_vulnerable_result: str
@@ -122,6 +126,9 @@ def _run_hacker_on_file(
                 "type": data.get("type", "Unknown"),
                 "explanation": data.get("explanation", ""),
                 "severity": data.get("severity", "High"),
+                "cvss_score": 0.0,
+                "cvss_vector": "",
+                "cvss_rating": "",
                 "exploit_payload": data.get("exploit_payload", ""),
                 "exploit_script": "",
                 "exploit_vulnerable_result": "",
@@ -325,6 +332,25 @@ def run_swarm(
     state["logs"].append("[Orchestrator] 💥 Generating exploit proofs...")
     for finding in state["findings"]:
         _run_exploit(finding, state)
+
+    # ── Phase 2b: CVSS Scoring ────────────────────────────────────────────────
+    state["logs"].append("[Orchestrator] 📊 Calculating CVSS 3.1 scores...")
+    for finding in state["findings"]:
+        try:
+            cvss = calculate_cvss(
+                finding["type"], finding["explanation"], finding["severity"]
+            )
+            finding["cvss_score"]  = cvss["score"]
+            finding["cvss_vector"] = cvss["vector"]
+            finding["cvss_rating"] = cvss["rating"]
+            state["logs"].append(
+                f"[Orchestrator] 📊 CVSS {cvss['score']} ({cvss['rating']}) — {finding['file_path']}"
+            )
+        except Exception as exc:
+            logger.warning("CVSS scoring failed for %s: %s", finding["file_path"], exc)
+            finding["cvss_score"]  = 0.0
+            finding["cvss_vector"] = ""
+            finding["cvss_rating"] = finding["severity"]
 
     # ── Phase 3 & 4: Engineer + Reviewer (per finding, with retries) ─────────
     state["logs"].append("[Orchestrator] 🛠 Starting fix and validation phase...")
