@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  sentinel-ai:
+    build: .
+    container_name: sentinel-ai
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./memory.json:/app/memory.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
