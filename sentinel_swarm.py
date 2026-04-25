@@ -127,38 +127,30 @@ def _run_hacker_on_file(
             continue
 
         try:
-            data = json.loads(_clean_json(raw), strict=False)
+            parsed = json.loads(_clean_json(raw), strict=False)
         except json.JSONDecodeError as exc:
             state["logs"].append(f"[Agent A - Hacker] ⚠️ JSON parse error on {file_path}: {exc}")
             logger.warning("JSON parse error for %s: %s | raw: %.200s", file_path, exc, raw)
             continue
 
         if data.get("vulnerability_found"):
-            # Parse CVSS inline
-            cvss_vector = data.get("cvss_vector", "")
-            cvss_score, cvss_rating = _score_from_vector(cvss_vector, data.get("severity", "High"))
-
             finding: VulnerabilityFinding = {
-                "file_path":               file_path,
-                "type":                    data.get("type", "Unknown"),
-                "explanation":             data.get("explanation", ""),
-                "severity":                data.get("severity", "High"),
-                "cvss_score":              cvss_score,
-                "cvss_vector":             cvss_vector,
-                "cvss_rating":             cvss_rating,
-                "exploit_payload":         data.get("exploit_payload", ""),
-                "exploit_script":          "",
+                "file_path": file_path,
+                "type": data.get("type", "Unknown"),
+                "explanation": data.get("explanation", ""),
+                "severity": data.get("severity", "High"),
+                "exploit_payload": data.get("exploit_payload", ""),
+                "exploit_script": "",
                 "exploit_vulnerable_result": "",
-                "exploit_patched_result":  "",
-                "original_code":           chunk,
-                "patched_code":            None,
-                "fix_explanation":         "",
-                "validation":              None,
+                "exploit_patched_result": "",
+                "original_code": chunk,
+                "patched_code": None,
+                "fix_explanation": "",
+                "validation": None,
             }
             state["findings"].append(finding)
             state["logs"].append(
-                f"[Agent A - Hacker] ⚠️ {data['type']} in {file_path} "
-                f"(CVSS {cvss_score} — {cvss_rating})"
+                f"[Agent A - Hacker] ⚠️ {data['type']} detected in {file_path}!"
             )
             found_any = True
 
@@ -279,14 +271,14 @@ def _run_engineer(finding: VulnerabilityFinding, state: SharedState) -> bool:
 
     try:
         data = json.loads(_clean_json(raw), strict=False)
-        finding["patched_code"]    = data["patched_code"]
+        finding["patched_code"] = data["patched_code"]
         finding["fix_explanation"] = data.get("fix_explanation", "")
         # Store learning pattern on the finding for memory phase
         finding["_vuln_pattern"]   = data.get("vuln_pattern", "")   # type: ignore[typeddict-unknown-key]
         finding["_fix_strategy"]   = data.get("fix_strategy", "")   # type: ignore[typeddict-unknown-key]
         state["logs"].append(f"[Agent B - Engineer] ✅ Patch generated for {finding['file_path']}")
         return True
-    except (json.JSONDecodeError, KeyError) as exc:
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         state["logs"].append(
             f"[Agent B - Engineer] ❌ Failed to parse patch for {finding['file_path']}: {exc}"
         )
@@ -324,7 +316,9 @@ def _run_reviewer(finding: VulnerabilityFinding, state: SharedState) -> None:
 
     try:
         data = json.loads(_clean_json(raw), strict=False)
-        if data.get("exploit_blocked") and data.get("functional_check") == "PASS":
+        blocked = data.get("exploit_blocked", False)
+        functional = data.get("functional_check", "FAIL")
+        if blocked and functional == "PASS":
             finding["validation"] = "PASS"
             state["logs"].append(f"[Agent C - Reviewer] ✅ {finding['file_path']} → SECURE")
         else:
@@ -334,7 +328,7 @@ def _run_reviewer(finding: VulnerabilityFinding, state: SharedState) -> None:
                 f"[Agent C - Reviewer] ❌ {finding['file_path']} → STILL VULNERABLE"
                 + (f": {notes}" if notes else "")
             )
-    except (json.JSONDecodeError, KeyError) as exc:
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         finding["validation"] = "FAIL"
         state["logs"].append(f"[Agent C - Reviewer] ❌ Parse error for {finding['file_path']}: {exc}")
         logger.warning("Reviewer parse error for %s: %s | raw: %.200s", finding["file_path"], exc, raw)
